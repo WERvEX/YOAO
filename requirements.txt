@@ -1,0 +1,24 @@
+# Core
+numpy>=1.24.0
+opencv-python>=4.8.0
+pyyaml>=6.0
+
+# Screen capture (Windows DXGI)
+dxcam>=0.0.6
+
+# ONNX Runtime inference (choose ONE GPU backend based on your hardware):
+onnxruntime>=1.15.0              # CPU fallback (always works)
+onnxruntime-directml>=1.15.0     # AMD/Intel GPU on Windows (DirectML)
+# onnxruntime-gpu>=1.15.0        # Uncomment for NVIDIA GPU (CUDA)
+
+# YOLO model (for training/export — not needed for inference only)
+ultralytics>=8.0.0
+
+# Hotkey monitoring
+pynput>=1.7.0
+
+# Optional: overlay UI
+pillow>=10.0.0
+
+# Development
+pytest>=7.0.0

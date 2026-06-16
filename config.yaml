@@ -1,0 +1,61 @@
+# =============================================================================
+# YOAO Runtime Configuration
+# =============================================================================
+
+# ---- Screen Capture ----
+capture:
+  # Window auto-detection (primary method)
+  window_title: ""            # Keyword to match game window title (e.g. "Counter-Strike")
+  auto_detect: false          # Set false to use manual region below
+  # Manual region override (used when auto_detect is false or detection fails)
+  region:
+    x: 0
+    y: 0
+    width: 1920
+    height: 1080
+  target_fps: 60              # Desired capture frame rate
+
+# ---- Detector ----
+detector:
+  model_path: "models/yolov8n.onnx"
+  confidence_threshold: 0.5   # Minimum confidence score
+  nms_threshold: 0.45         # NMS IoU threshold
+  input_size: [640, 640]      # Model input dimensions
+  target_classes: [0]         # Class IDs to target (0=person for COCO pre-trained)
+  # Target selection mode: "nearest_crosshair" | "highest_confidence" | "largest_bbox"
+  target_mode: "nearest_crosshair"
+
+# ---- Mouse Control ----
+mouse:
+  # Movement parameters
+  move_speed: 1.0             # Speed multiplier (1.0 = default)
+  smoothness: 0.8             # Path smoothness (0=linear, 1=max curves)
+  jitter_enabled: true        # Add micro-jitter for human-like movement
+  jitter_amplitude: 2         # Jitter amplitude in pixels
+  # Target offset (offset from bbox center as fraction of bbox height)
+  # Negative = above center (toward head). For head detection: -0.15
+  head_offset: -0.15
+
+# ---- Pipeline ----
+pipeline:
+  # Hotkey configuration
+  toggle_hotkey: "ctrl+shift+a"  # Toggle aiming on/off
+  quit_hotkey: "ctrl+shift+q"    # Quit application
+  # Performance
+  show_fps: true
+
+# ---- Overlay ----
+overlay:
+  enabled: true               # Show detection overlay window
+  show_boxes: true            # Draw detection boxes
+  show_labels: true           # Show class labels and confidence
+  show_fps: true              # Show FPS counter
+  show_status: true           # Show active/inactive status
+  window_alpha: 0.7           # Overlay window transparency (0-1)
+
+# ---- ONNX Runtime ----
+onnx:
+  execution_provider: "auto"  # "auto" | "cuda" | "directml" | "cpu"
+  # auto: tries CUDA → DirectML → CPU
+  intra_op_threads: 2         # Threads for parallel ops
+  enable_profiling: false     # ONNX Runtime profiling
