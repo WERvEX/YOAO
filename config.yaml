@@ -17,7 +17,7 @@ capture:
 
 # ---- Detector ----
 detector:
-  model_path: "models/yolov8n.onnx"
+  model_path: "models/best.onnx"
   confidence_threshold: 0.5   # Minimum confidence score
   nms_threshold: 0.45         # NMS IoU threshold
   input_size: [640, 640]      # Model input dimensions

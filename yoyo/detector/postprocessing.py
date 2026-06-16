@@ -1,8 +1,15 @@
-"""Postprocessing for YOLOv8 ONNX outputs.
+"""Postprocessing for YOLO ONNX outputs — supports two output formats.
 
-YOLOv8 ONNX output shape: (1, 84, 8400) for 640×640 input with 80 COCO classes.
-  - Channels 0-3: bbox center_x, center_y, width, height (normalized 0-1)
-  - Channels 4-83: class scores (80 classes for COCO)
+Format A — Raw anchor-based (YOLOv8 standard):
+  Shape: (1, 84, 8400) or (1, 4+C, N) for 640×640 input.
+  Channels 0-3: bbox cx, cy, w, h (normalized 0-1).
+  Channels 4+: class scores (80 for COCO).
+  Needs: NMS, cxcywh→xyxy, class argmax.
+
+Format B — Post-processed (exported with NMS, e.g. best.onnx):
+  Shape: (1, 300, 6) = [x1, y1, x2, y2, confidence, class_id].
+  Already in xyxy pixel coords (model input space), already NMS'd.
+  Needs: scaling to frame space only.
 
 Target selection strategies are applied here — the detector returns either
 the best single target or all detections for overlay rendering.
@@ -35,16 +42,16 @@ def parse_detections(
     frame_size: Tuple[int, int] = (1920, 1080),
     head_offset: float = -0.15,
 ) -> List[Detection]:
-    """Parse raw YOLOv8 ONNX output into Detection objects.
+    """Parse YOLO ONNX output into Detection objects — auto-detects output format.
 
-    YOLOv8 ONNX output (nano/small): (1, 84, 8400)
-      - 4 bbox params (cx, cy, w, h), normalized to model input space
-      - 80 class logits (for COCO pre-trained)
+    Supports two formats:
+      - Raw anchor-based: (1, 84, 8400) — YOLOv8 standard output
+      - Post-processed:   (1, N, 6) — model exported with NMS, e.g. best.onnx
 
     Args:
-        output: Raw ONNX model output, shape (1, 84, 8400) or (84, 8400).
+        output: Raw ONNX model output.
         confidence_threshold: Minimum class confidence to keep a detection.
-        nms_threshold: IoU threshold for Non-Maximum Suppression.
+        nms_threshold: IoU threshold for NMS (only used for raw format).
         target_classes: List of class IDs to consider. None = all classes.
         input_size: Model input (width, height).
         frame_size: Original frame (width, height).
@@ -54,6 +61,15 @@ def parse_detections(
     Returns:
         List of Detection objects sorted by confidence (descending).
     """
+    if output.ndim == 3 and output.shape[2] == 6:
+        # Post-processed format: (1, N, 6) = [x1, y1, x2, y2, score, class]
+        return _parse_postprocessed(
+            output, confidence_threshold, target_classes,
+            input_size, frame_size, head_offset,
+        )
+
+    # ── Raw anchor-based format ────────────────────────────────────────
+
     # Squeeze batch dimension if present
     if output.ndim == 3:
         output = output[0]  # (84, 8400)
@@ -137,6 +153,87 @@ def parse_detections(
             center=center,
             confidence=float(confidences[i]),
             class_id=int(class_ids[i]),
+            aim_point=aim_point,
+        ))
+
+    # Sort by confidence descending
+    detections.sort(key=lambda d: d.confidence, reverse=True)
+    return detections
+
+
+def _parse_postprocessed(
+    output: np.ndarray,
+    confidence_threshold: float,
+    target_classes: Optional[List[int]],
+    input_size: Tuple[int, int],
+    frame_size: Tuple[int, int],
+    head_offset: float,
+) -> List[Detection]:
+    """Parse post-processed ONNX output: (1, N, 6) where each row is
+    [x1, y1, x2, y2, confidence, class_id].
+
+    This format comes from models exported with built-in NMS (e.g. exported
+    from ultralytics with nms=True, or some fine-tuned single-class models).
+    Coordinates are in model-input pixel space (e.g. 640×640), already xyxy,
+    already NMS'd — we only need to filter, scale, and compute aim points.
+    """
+    dets = output[0]  # (N, 6)
+
+    if dets.shape[1] != 6:
+        return []
+
+    x1_arr = dets[:, 0]
+    y1_arr = dets[:, 1]
+    x2_arr = dets[:, 2]
+    y2_arr = dets[:, 3]
+    scores = dets[:, 4]
+    class_ids = dets[:, 5].astype(np.int32)
+
+    # Filter by confidence + target classes
+    mask = scores >= confidence_threshold
+    if target_classes is not None and len(target_classes) > 0:
+        mask = mask & np.isin(class_ids, target_classes)
+
+    indices = np.where(mask)[0]
+    if len(indices) == 0:
+        return []
+
+    # Scale from model input space to frame pixel space
+    input_w, input_h = input_size
+    frame_w, frame_h = frame_size
+    scale_x = frame_w / input_w
+    scale_y = frame_h / input_h
+
+    detections: List[Detection] = []
+    for idx in indices:
+        bx1 = int(x1_arr[idx] * scale_x)
+        by1 = int(y1_arr[idx] * scale_y)
+        bx2 = int(x2_arr[idx] * scale_x)
+        by2 = int(y2_arr[idx] * scale_y)
+
+        # Clamp to frame bounds (coordinates may go outside model input space)
+        bx1 = max(0, min(frame_w, bx1))
+        by1 = max(0, min(frame_h, by1))
+        bx2 = max(0, min(frame_w, bx2))
+        by2 = max(0, min(frame_h, by2))
+
+        # Skip degenerate boxes
+        if bx2 <= bx1 or by2 <= by1:
+            continue
+
+        bbox = (bx1, by1, bx2, by2)
+        bbox_h = by2 - by1
+        center = ((bx1 + bx2) // 2, (by1 + by2) // 2)
+
+        # Aim point: offset from bbox center toward top (head area)
+        aim_y = int(center[1] + head_offset * bbox_h)
+        aim_point = (center[0], max(0, aim_y))
+
+        detections.append(Detection(
+            bbox=bbox,
+            center=center,
+            confidence=float(scores[idx]),
+            class_id=int(class_ids[idx]),
             aim_point=aim_point,
         ))
 
