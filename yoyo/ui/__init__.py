@@ -2,10 +2,10 @@
 
 
 def __getattr__(name):
-    if name == "DetectionOverlay":
-        from .overlay import DetectionOverlay
-        return DetectionOverlay
+    if name == "ScreenOverlay":
+        from .overlay import ScreenOverlay
+        return ScreenOverlay
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["DetectionOverlay"]
+__all__ = ["ScreenOverlay"]

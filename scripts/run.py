@@ -13,7 +13,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import yaml
 
@@ -36,7 +36,7 @@ from yoyo.config.schema import (
 from yoyo.detector import YOLODetector
 from yoyo.mouse import MouseController
 from yoyo.orchestrator import AimBotPipeline
-from yoyo.ui import DetectionOverlay
+from yoyo.ui import ScreenOverlay
 
 # Configure logging
 logging.basicConfig(
@@ -84,14 +84,14 @@ def load_config(config_path: str) -> AppConfig:
 
 def build_components(
     config: AppConfig,
-) -> Tuple[DXGICapture, YOLODetector, MouseController, DetectionOverlay]:
-    """Build all pipeline components from configuration.
+) -> Tuple[DXGICapture, YOLODetector, MouseController]:
+    """Build core pipeline components from configuration.
 
     Args:
         config: Application configuration.
 
     Returns:
-        Tuple of (capture, detector, mouse, overlay) instances.
+        Tuple of (capture, detector, mouse) instances.
     """
     # Capture
     region = (
@@ -126,17 +126,7 @@ def build_components(
         jitter_amplitude=config.mouse.jitter_amplitude,
     )
 
-    # Overlay
-    overlay = DetectionOverlay(
-        enabled=config.overlay.enabled,
-        show_boxes=config.overlay.show_boxes,
-        show_labels=config.overlay.show_labels,
-        show_fps=config.overlay.show_fps,
-        show_status=config.overlay.show_status,
-        window_alpha=config.overlay.window_alpha,
-    )
-
-    return capture, detector, mouse, overlay
+    return capture, detector, mouse
 
 
 def main():
@@ -200,7 +190,7 @@ Examples:
     print("=" * 60)
     print()
 
-    capture, detector, mouse, overlay = build_components(config)
+    capture, detector, mouse = build_components(config)
 
     # Initialize detector (load ONNX model)
     print("Initializing detector...")
@@ -218,29 +208,35 @@ Examples:
         quit_hotkey=config.pipeline.quit_hotkey,
     )
 
-    # Register overlay callback
-    if config.overlay.enabled:
-        pipeline.add_frame_callback(overlay.on_frame)
-
     # Start pipeline
     print("Starting pipeline...")
     if not pipeline.start():
         print("ERROR: Failed to start pipeline.")
         sys.exit(1)
 
-    print(f"Pipeline running. Press {config.pipeline.toggle_hotkey} to toggle aiming.")
-    print(f"Press {config.pipeline.quit_hotkey} or close overlay to quit.\n")
+    # Create and show screen overlay positioned over the capture region
+    overlay: Optional[ScreenOverlay] = None
+    if config.overlay.enabled:
+        region = capture.get_region()
+        if region is not None:
+            overlay = ScreenOverlay(
+                region=region,
+                enabled=True,
+                show_boxes=config.overlay.show_boxes,
+                show_labels=config.overlay.show_labels,
+                show_fps=config.overlay.show_fps,
+                show_status=config.overlay.show_status,
+            )
+            overlay.show()
+            pipeline.add_frame_callback(overlay.on_frame)
 
-    # Main loop — render overlay and check for exit
+    print(f"Pipeline running. Press {config.pipeline.toggle_hotkey} to toggle aiming.")
+    print(f"Press {config.pipeline.quit_hotkey} to quit.\n")
+
+    # Main loop — sleep until quit
     try:
         while pipeline.is_running and not pipeline.should_quit:
-            if config.overlay.enabled:
-                overlay.update()
-                if overlay.should_close:
-                    print("\nOverlay closed. Shutting down...")
-                    break
-
-            time.sleep(0.005)  # ~200 Hz main loop
+            time.sleep(0.1)  # 10 Hz is plenty for quit polling
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
@@ -248,7 +244,8 @@ Examples:
     finally:
         print("Stopping pipeline...")
         pipeline.stop()
-        overlay.destroy()
+        if overlay is not None:
+            overlay.hide()
         print("Done.")
 
 

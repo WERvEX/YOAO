@@ -237,14 +237,21 @@ class AimBotPipeline:
 
         frame_count = 0
         last_fps_report = time.perf_counter()
+        last_frame_ts: float = 0.0  # Dedup: skip frames we've already processed
 
         while self._running:
-            # Get latest frame from capture (blocking poll)
+            # Get latest frame from capture
             frame = self._capture.get_latest_frame()
 
             if frame is None:
-                time.sleep(0.001)
+                time.sleep(0.002)
                 continue
+
+            # Skip if this is the same frame we already processed
+            if frame.timestamp == last_frame_ts:
+                time.sleep(0.002)
+                continue
+            last_frame_ts = frame.timestamp
 
             # Run detection
             t0 = time.perf_counter()
@@ -256,7 +263,7 @@ class AimBotPipeline:
             # Select target
             target = self._detector.select_best(
                 detections,
-                crosshair_pos=None,  # Use center of frame = center of capture region
+                crosshair_pos=None,
                 frame_size=(frame.width, frame.height),
             )
 
@@ -266,15 +273,14 @@ class AimBotPipeline:
                 target=target,
                 frame_timestamp=frame.timestamp,
                 detect_time_ms=dt_ms,
-                frame=frame.image,  # For overlay
+                frame=frame.image if self._on_frame_callbacks else None,
             )
             try:
                 self._result_queue.put_nowait(result)
             except queue.Full:
-                # Discard stale result — mouse thread is behind
                 pass
 
-            # Update stats periodically
+            # Update stats periodically (once per second)
             now = time.perf_counter()
             if now - last_fps_report >= 1.0:
                 with self._stats_lock:
@@ -285,7 +291,7 @@ class AimBotPipeline:
                 frame_count = 0
                 last_fps_report = now
 
-            # Notify overlay callbacks
+            # Notify overlay callbacks (only when there are subscribers)
             for cb in self._on_frame_callbacks:
                 try:
                     cb(frame.image, detections, target, self.stats)

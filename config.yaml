@@ -39,8 +39,8 @@ mouse:
 # ---- Pipeline ----
 pipeline:
   # Hotkey configuration
-  toggle_hotkey: "ctrl+shift+a"  # Toggle aiming on/off
-  quit_hotkey: "ctrl+shift+q"    # Quit application
+  toggle_hotkey: "alt+i"  # Toggle aiming on/off
+  quit_hotkey: "alt+o"    # Quit application
   # Performance
   show_fps: true
 
