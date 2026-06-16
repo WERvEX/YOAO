@@ -477,6 +477,16 @@ class ScreenOverlay:
         ctypes.windll.gdi32.DeleteObject(pen_detect)
         ctypes.windll.gdi32.DeleteObject(pen_aim)
 
+        # Fix alpha channel: GDI draws alpha=0 on 32-bit DIB sections.
+        # We need non-background pixels to have alpha=255 for UpdateLayeredWindow
+        # with AC_SRC_ALPHA to actually show anything.
+        arr = np.ctypeslib.as_array(
+            ctypes.cast(self._dib_bits, ctypes.POINTER(ctypes.c_uint8)),
+            shape=(self._h, self._w, 4),
+        )
+        alpha_mask = np.any(arr[:, :, :3] > 0, axis=2)
+        arr[:, :, 3] = np.where(alpha_mask, 255, 0).astype(np.uint8)
+
         # Present: blit memory DC to window using UpdateLayeredWindow
         blend = ctypes.wintypes.BLENDFUNCTION()
         blend.BlendOp = AC_SRC_OVER

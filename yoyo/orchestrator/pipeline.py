@@ -329,7 +329,7 @@ class AimBotPipeline:
                     if abs(ax - lx) < 3 and abs(ay - ly) < 3:
                         continue  # Same target, skip redundant move
 
-                self._mouse.move_to(ax, ay)
+                self._mouse.teleport_to(ax, ay)
                 last_target_pos = (ax, ay)
             else:
                 last_target_pos = None
