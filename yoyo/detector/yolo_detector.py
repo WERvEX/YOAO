@@ -150,8 +150,8 @@ class YOLODetector:
 
         frame_h, frame_w = image.shape[:2]
 
-        # Preprocess
-        tensor = preprocess(image, self._input_size)
+        # Preprocess (letterbox — returns tensor + padding info for reverse mapping)
+        tensor, lb_info = preprocess(image, self._input_size)
 
         # Inference
         start = time.perf_counter()
@@ -172,6 +172,7 @@ class YOLODetector:
             input_size=self._input_size,
             frame_size=(frame_w, frame_h),
             head_offset=self._head_offset,
+            lb_info=lb_info,
         )
 
         return detections

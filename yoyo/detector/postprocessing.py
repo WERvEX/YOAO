@@ -21,6 +21,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from .preprocessing import LetterboxInfo
+
 
 @dataclass
 class Detection:
@@ -41,6 +43,7 @@ def parse_detections(
     input_size: Tuple[int, int] = (640, 640),
     frame_size: Tuple[int, int] = (1920, 1080),
     head_offset: float = -0.15,
+    lb_info: Optional[LetterboxInfo] = None,
 ) -> List[Detection]:
     """Parse YOLO ONNX output into Detection objects — auto-detects output format.
 
@@ -56,7 +59,7 @@ def parse_detections(
         input_size: Model input (width, height).
         frame_size: Original frame (width, height).
         head_offset: Vertical aim offset as fraction of bbox height.
-                     Negative = above center (toward head).
+        lb_info: Letterbox padding info for correct coordinate reverse-mapping.
 
     Returns:
         List of Detection objects sorted by confidence (descending).
@@ -65,7 +68,7 @@ def parse_detections(
         # Post-processed format: (1, N, 6) = [x1, y1, x2, y2, score, class]
         return _parse_postprocessed(
             output, confidence_threshold, target_classes,
-            input_size, frame_size, head_offset,
+            input_size, frame_size, head_offset, lb_info,
         )
 
     # ── Raw anchor-based format ────────────────────────────────────────
@@ -121,18 +124,40 @@ def parse_detections(
     confidences = confidences[keep_indices]
     class_ids = class_ids[keep_indices]
 
-    # Scale coordinates to original frame size
+    # Scale coordinates to original frame size (reverse letterbox)
     input_w, input_h = input_size
     frame_w, frame_h = frame_size
-    scale_x = frame_w / input_w
-    scale_y = frame_h / input_h
+
+    if lb_info is not None:
+        # Letterbox reverse mapping: denormalize → un-pad → scale to original
+        pad_x = lb_info.pad_left
+        pad_y = lb_info.pad_top
+        scale = lb_info.scale
+    else:
+        # Fallback: simple stretch resize
+        pad_x, pad_y = 0, 0
+        scale = 1.0
 
     detections: List[Detection] = []
     for i in range(len(boxes_xyxy)):
-        bx1 = int(boxes_xyxy[i, 0] * scale_x)
-        by1 = int(boxes_xyxy[i, 1] * scale_y)
-        bx2 = int(boxes_xyxy[i, 2] * scale_x)
-        by2 = int(boxes_xyxy[i, 3] * scale_y)
+        if lb_info is not None:
+            # Denormalize to letterbox pixel coords: norm * input_size
+            bx1_px = boxes_xyxy[i, 0] * input_w
+            by1_px = boxes_xyxy[i, 1] * input_h
+            bx2_px = boxes_xyxy[i, 2] * input_w
+            by2_px = boxes_xyxy[i, 3] * input_h
+            # Reverse letterbox
+            bx1 = int((bx1_px - pad_x) / scale)
+            by1 = int((by1_px - pad_y) / scale)
+            bx2 = int((bx2_px - pad_x) / scale)
+            by2 = int((by2_px - pad_y) / scale)
+        else:
+            scale_x = frame_w / input_w
+            scale_y = frame_h / input_h
+            bx1 = int(boxes_xyxy[i, 0] * scale_x)
+            by1 = int(boxes_xyxy[i, 1] * scale_y)
+            bx2 = int(boxes_xyxy[i, 2] * scale_x)
+            by2 = int(boxes_xyxy[i, 3] * scale_y)
 
         # Clamp to frame bounds
         bx1 = max(0, min(frame_w, bx1))
@@ -168,14 +193,14 @@ def _parse_postprocessed(
     input_size: Tuple[int, int],
     frame_size: Tuple[int, int],
     head_offset: float,
+    lb_info: Optional[LetterboxInfo] = None,
 ) -> List[Detection]:
     """Parse post-processed ONNX output: (1, N, 6) where each row is
     [x1, y1, x2, y2, confidence, class_id].
 
-    This format comes from models exported with built-in NMS (e.g. exported
-    from ultralytics with nms=True, or some fine-tuned single-class models).
-    Coordinates are in model-input pixel space (e.g. 640×640), already xyxy,
-    already NMS'd — we only need to filter, scale, and compute aim points.
+    This format comes from models exported with built-in NMS. Coordinates are
+    in model input space (e.g. 640×640 letterbox). We reverse the letterbox
+    padding + scaling to map to original frame pixel coordinates.
     """
     dets = output[0]  # (N, 6)
 
@@ -198,20 +223,39 @@ def _parse_postprocessed(
     if len(indices) == 0:
         return []
 
-    # Scale from model input space to frame pixel space
-    input_w, input_h = input_size
     frame_w, frame_h = frame_size
-    scale_x = frame_w / input_w
-    scale_y = frame_h / input_h
+
+    # Reverse letterbox: coordinates are in the letterbox'd 640×640 space.
+    # To map back to original frame coords: subtract padding, divide by scale.
+    if lb_info is not None:
+        pad_x = lb_info.pad_left
+        pad_y = lb_info.pad_top
+        scale = lb_info.scale
+    else:
+        # Fallback: assume simple stretch resize
+        input_w, input_h = input_size
+        pad_x, pad_y = 0, 0
+        scale = input_w / frame_w  # same as 1/scale_x
 
     detections: List[Detection] = []
     for idx in indices:
-        bx1 = int(x1_arr[idx] * scale_x)
-        by1 = int(y1_arr[idx] * scale_y)
-        bx2 = int(x2_arr[idx] * scale_x)
-        by2 = int(y2_arr[idx] * scale_y)
+        # Map from letterbox space → original frame space
+        if lb_info is not None:
+            bx1 = int((x1_arr[idx] - pad_x) / scale)
+            by1 = int((y1_arr[idx] - pad_y) / scale)
+            bx2 = int((x2_arr[idx] - pad_x) / scale)
+            by2 = int((y2_arr[idx] - pad_y) / scale)
+        else:
+            # Old stretch-resize fallback
+            input_w, input_h = input_size
+            scale_x = frame_w / input_w
+            scale_y = frame_h / input_h
+            bx1 = int(x1_arr[idx] * scale_x)
+            by1 = int(y1_arr[idx] * scale_y)
+            bx2 = int(x2_arr[idx] * scale_x)
+            by2 = int(y2_arr[idx] * scale_y)
 
-        # Clamp to frame bounds (coordinates may go outside model input space)
+        # Clamp to frame bounds
         bx1 = max(0, min(frame_w, bx1))
         by1 = max(0, min(frame_h, by1))
         bx2 = max(0, min(frame_w, bx2))

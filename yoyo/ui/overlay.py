@@ -1,113 +1,47 @@
-"""Transparent screen overlay — drawn directly on the desktop using Win32 layered windows.
+"""Transparent screen overlay using PyQt6 — drawn directly on the desktop.
 
-Creates a click-through, topmost, transparent window positioned over the capture
-region. Detection boxes, labels, FPS, and status are rendered using GDI primitives
-with no external window framework overhead.
+Creates a frameless, topmost, click-through transparent window positioned
+over the capture region. Detection boxes, labels, FPS, and status are
+rendered using QPainter.
 
 Key properties:
-  - WS_EX_LAYERED + WS_EX_TRANSPARENT: transparent, click-through (doesn't steal focus)
-  - WS_EX_TOPMOST: stays above the game window
-  - UpdateLayeredWindow: per-pixel alpha blending for smooth rendering
-  - GDI drawing: minimal overhead, no OpenCV window event loop
+  - Qt.WA_TranslucentBackground: per-pixel transparency
+  - Qt.WindowStaysOnTopHint: always above game window
+  - Qt.WA_TransparentForMouseEvents: click-through (no input interception)
+  - pyqtSignal: thread-safe update from detector thread → Qt main thread
 """
 
-import ctypes
-import ctypes.wintypes
 import logging
 import threading
 from typing import List, Optional, Tuple
 
 import numpy as np
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from PyQt6.QtWidgets import QWidget
 
 from ..detector.postprocessing import Detection
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Missing wintypes (Python version-dependent availability)
-# ---------------------------------------------------------------------------
-if not hasattr(ctypes.wintypes, "HCURSOR"):
-    ctypes.wintypes.HCURSOR = ctypes.wintypes.HANDLE
 
+class ScreenOverlay(QWidget):
+    """Transparent screen overlay rendered with PyQt6 + QPainter.
 
-# ---------------------------------------------------------------------------
-# Custom Win32 structures
-# ---------------------------------------------------------------------------
-
-WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_long, ctypes.c_uint,
-                              ctypes.c_long, ctypes.c_long)
-
-
-class WNDCLASSW(ctypes.Structure):
-    _fields_ = [
-        ("style", ctypes.wintypes.UINT),
-        ("lpfnWndProc", WNDPROC),
-        ("cbClsExtra", ctypes.c_int),
-        ("cbWndExtra", ctypes.c_int),
-        ("hInstance", ctypes.wintypes.HINSTANCE),
-        ("hIcon", ctypes.wintypes.HICON),
-        ("hCursor", ctypes.wintypes.HCURSOR),
-        ("hbrBackground", ctypes.wintypes.HBRUSH),
-        ("lpszMenuName", ctypes.wintypes.LPCWSTR),
-        ("lpszClassName", ctypes.wintypes.LPCWSTR),
-    ]
-
-
-class BITMAPINFOHEADER(ctypes.Structure):
-    _fields_ = [
-        ("biSize", ctypes.c_uint32),
-        ("biWidth", ctypes.c_int32),
-        ("biHeight", ctypes.c_int32),
-        ("biPlanes", ctypes.c_uint16),
-        ("biBitCount", ctypes.c_uint16),
-        ("biCompression", ctypes.c_uint32),
-        ("biSizeImage", ctypes.c_uint32),
-        ("biXPelsPerMeter", ctypes.c_int32),
-        ("biYPelsPerMeter", ctypes.c_int32),
-        ("biClrUsed", ctypes.c_uint32),
-        ("biClrImportant", ctypes.c_uint32),
-    ]
-
-# ---------------------------------------------------------------------------
-# Win32 constants
-# ---------------------------------------------------------------------------
-WS_EX_LAYERED = 0x00080000
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_TOPMOST = 0x00000008
-WS_POPUP = 0x80000000
-ULW_ALPHA = 0x00000002
-AC_SRC_OVER = 0x00
-AC_SRC_ALPHA = 0x01
-
-# GDI
-SRCCOPY = 0x00CC0020
-
-# Colors (BGR for GDI)
-COLOR_BG = 0x00000000        # Fully transparent
-COLOR_TARGET = 0x0000FF00    # Green
-COLOR_DETECTION = 0x00A5FF   # Orange
-COLOR_AIM = 0x000000FF       # Red
-COLOR_CROSSHAIR = 0x00FFFF00 # Cyan
-COLOR_STATUS_ON = 0x0000FF00 # Green
-COLOR_STATUS_OFF = 0x000000FF # Red
-COLOR_TEXT = 0x00FFFFFF      # White
-
-
-class ScreenOverlay:
-    """Transparent screen overlay drawn directly on the Windows desktop.
-
-    Renders detection bounding boxes, aim points, FPS, and status
-    using GDI on a layered window. The window is click-through and
-    topmost — it appears over the game without intercepting input.
+    Renders detection bounding boxes, aim points, FPS, and status on a
+    frameless, click-through, topmost window.
 
     Usage:
         overlay = ScreenOverlay(region=(0, 0, 1920, 1080))
         overlay.show()
         # ... from detector callback thread:
-        overlay.update(detections, target, active=True, fps=60.0, detect_ms=15.0)
-        # ... on shutdown:
-        overlay.hide()
+        pipeline.add_frame_callback(overlay.on_frame)
+        # ... main thread runs Qt event loop:
+        app.exec()
     """
+
+    # Signal emitted from detector thread to trigger repaint on Qt main thread
+    _frame_ready = pyqtSignal()
 
     def __init__(
         self,
@@ -121,45 +55,50 @@ class ScreenOverlay:
         """Initialize the screen overlay.
 
         Args:
-            region: Screen region to cover as (x, y, w, h). None = full virtual screen.
+            region: Screen region to cover as (x, y, w, h). None = full primary screen.
             enabled: Whether the overlay is visible.
             show_boxes: Draw detection bounding boxes.
             show_labels: Show class/confidence labels.
             show_fps: Display FPS counter.
             show_status: Show aiming active/inactive indicator.
         """
+        super().__init__()
+
         self._enabled = enabled
         self._show_boxes = show_boxes
         self._show_labels = show_labels
         self._show_fps = show_fps
         self._show_status = show_status
 
-        # Window dimensions
+        # Window position and size
         if region is not None:
             self._x, self._y, self._w, self._h = region
         else:
-            self._x = ctypes.windll.user32.GetSystemMetrics(0)
-            self._y = ctypes.windll.user32.GetSystemMetrics(1)
-            self._w = ctypes.windll.user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
-            self._h = ctypes.windll.user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+            from PyQt6.QtGui import QGuiApplication
+            screen = QGuiApplication.primaryScreen()
+            if screen:
+                geom = screen.geometry()
+                self._x, self._y = 0, 0
+                self._w, self._h = geom.width(), geom.height()
+            else:
+                self._x, self._y, self._w, self._h = 0, 0, 1920, 1080
 
-        # GDI handles
-        self._hwnd = None
-        self._hdc = None
-        self._mem_dc = None
-        self._bitmap = None
-        self._old_bitmap = None
-        self._font: Optional[Tuple] = None  # (hfont, height)
-
-        # Thread safety for update data
+        # Thread-safe rendering data
         self._lock = threading.Lock()
-        self._visible = False
+        self._detections: List[Detection] = []
+        self._target: Optional[Detection] = None
+        self._active: bool = False
+        self._fps: float = 0.0
+        self._detect_ms: float = 0.0
 
-        # Pre-register window class
-        self._register_class()
+        # Setup window
+        self._setup_window()
+
+        # Connect signal: emitted from detector thread → repaint on Qt thread
+        self._frame_ready.connect(self._on_frame_ready)
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API (compatible with old Win32 ScreenOverlay)
     # ------------------------------------------------------------------
 
     @property
@@ -175,23 +114,13 @@ class ScreenOverlay:
             self.hide()
 
     def show(self) -> None:
-        """Create and show the transparent overlay window."""
-        if not self._enabled or self._visible:
-            return
-
-        self._create_window()
-        self._visible = True
+        """Show the overlay window."""
+        if self._enabled:
+            super().show()
 
     def hide(self) -> None:
-        """Destroy the overlay window."""
-        if not self._visible:
-            return
-
-        self._destroy_gdi()
-        if self._hwnd:
-            ctypes.windll.user32.DestroyWindow(self._hwnd)
-            self._hwnd = None
-        self._visible = False
+        """Hide the overlay window."""
+        super().hide()
 
     def update(
         self,
@@ -201,32 +130,15 @@ class ScreenOverlay:
         fps: float = 0.0,
         detect_ms: float = 0.0,
     ) -> None:
-        """Render and display detection data on the overlay.
-
-        Thread-safe — can be called from any thread. The actual
-        GDI drawing happens synchronously (GDI is not thread-safe,
-        but we serialize through the lock and the single rendering call).
-
-        Args:
-            detections: All detections for this frame.
-            target: The selected target to aim at, or None.
-            active: Whether aiming is currently active.
-            fps: Detection FPS.
-            detect_ms: Last detection time in milliseconds.
-        """
-        if not self._visible or not self._hwnd:
-            return
-
-        # Copy data under lock, then draw outside lock
+        """Thread-safe: store detection data and request repaint."""
         with self._lock:
-            # Shallow copies — the Detection objects are immutable-ish for rendering
-            dets = list(detections)
-            tgt = target
-            is_active = active
-            cur_fps = fps
-            cur_ms = detect_ms
-
-        self._draw_frame(dets, tgt, is_active, cur_fps, cur_ms)
+            self._detections = list(detections)
+            self._target = target
+            self._active = active
+            self._fps = fps
+            self._detect_ms = detect_ms
+        # Signal Qt main thread to repaint (thread-safe)
+        self._frame_ready.emit()
 
     def on_frame(
         self,
@@ -237,13 +149,11 @@ class ScreenOverlay:
     ) -> None:
         """Callback compatible with AimBotPipeline.add_frame_callback.
 
-        Note: `frame` is accepted but ignored — the overlay renders
-        graphics on top of the screen, not on the captured frame.
-        `stats` is a PipelineStats object.
+        Called from detector thread. `frame` is ignored — overlay renders
+        on the screen, not on a frame copy.
         """
         if not self._enabled:
             return
-
         self.update(
             detections=detections,
             target=target,
@@ -253,259 +163,103 @@ class ScreenOverlay:
         )
 
     # ------------------------------------------------------------------
-    # Win32 Window
+    # Qt Window Setup
     # ------------------------------------------------------------------
 
-    def _register_class(self) -> None:
-        """Register a Win32 window class for the overlay."""
-        module_handle = ctypes.windll.kernel32.GetModuleHandleW(None)
+    def _setup_window(self) -> None:
+        """Configure the overlay as a frameless, transparent, topmost, click-through window."""
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
-        wndproc = ctypes.WINFUNCTYPE(
-            ctypes.c_long, ctypes.c_long, ctypes.c_uint,
-            ctypes.c_long, ctypes.c_long,
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
         )
 
-        def _wnd_proc(hwnd, msg, wparam, lparam):
-            # Minimal window proc — we don't handle input
-            return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+        self.setGeometry(self._x, self._y, self._w, self._h)
+        self.setStyleSheet("background: transparent;")
 
-        self._wndproc = wndproc(_wnd_proc)
-
-        class_name = "YOAOScreenOverlay"
-
-        wc = WNDCLASSW()
-        wc.lpfnWndProc = self._wndproc
-        wc.hInstance = module_handle
-        wc.lpszClassName = class_name
-        wc.hbrBackground = ctypes.windll.gdi32.GetStockObject(5)  # NULL_BRUSH
-        wc.style = 0
-        wc.cbClsExtra = 0
-        wc.cbWndExtra = 0
-        wc.hIcon = None
-        wc.hCursor = None
-
-        atom = ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
-        if atom == 0:
-            err = ctypes.get_last_error()
-            if err != 1410:  # ERROR_CLASS_ALREADY_EXISTS
-                logger.error(f"RegisterClassW failed: {err}")
-        self._class_name = class_name
-
-    def _create_window(self) -> None:
-        """Create the layered, transparent, topmost, click-through window."""
-        module_handle = ctypes.windll.kernel32.GetModuleHandleW(None)
-
-        ex_style = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST
-        style = WS_POPUP
-
-        self._hwnd = ctypes.windll.user32.CreateWindowExW(
-            ex_style,
-            self._class_name,
-            "YOAO Overlay",
-            style,
-            self._x, self._y, self._w, self._h,
-            None,  # parent
-            None,  # menu
-            module_handle,
-            None,  # lparam
-        )
-
-        if not self._hwnd:
-            logger.error(f"CreateWindowExW failed: {ctypes.get_last_error()}")
-            return
-
-        # Setup GDI resources
-        self._init_gdi()
-
-        # Show the window
-        ctypes.windll.user32.ShowWindow(self._hwnd, 1)  # SW_SHOWNORMAL
-        # Make fully transparent initially
-        ctypes.windll.user32.SetLayeredWindowAttributes(
-            self._hwnd, 0, 255, 0x00000002  # LWA_ALPHA
-        )
+        # Use a fixed-size font for status/fps text
+        self._font = QFont("Consolas", 12)
+        self._font.setStyleHint(QFont.StyleHint.Monospace)
 
     # ------------------------------------------------------------------
-    # GDI Drawing
+    # Qt Slots
     # ------------------------------------------------------------------
 
-    def _init_gdi(self) -> None:
-        """Initialize GDI resources for double-buffered drawing."""
-        screen_dc = ctypes.windll.user32.GetDC(0)
-        self._hdc = ctypes.windll.gdi32.CreateCompatibleDC(screen_dc)
-        self._mem_dc = ctypes.windll.gdi32.CreateCompatibleDC(screen_dc)
-        ctypes.windll.user32.ReleaseDC(0, screen_dc)
+    def _on_frame_ready(self) -> None:
+        """Slot: called on Qt main thread when new frame data is available."""
+        # Call QWidget.update() — NOT our override which would recurse infinitely.
+        super().update()
 
-        # Create a 32-bit bitmap for per-pixel alpha
-        bi = BITMAPINFOHEADER()
-        bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bi.biWidth = self._w
-        bi.biHeight = -self._h  # Negative = top-down DIB
-        bi.biPlanes = 1
-        bi.biBitCount = 32
-        bi.biCompression = 0  # BI_RGB
+    # ------------------------------------------------------------------
+    # QPainter Rendering
+    # ------------------------------------------------------------------
 
-        ppv_bits = ctypes.c_void_p()
-        self._bitmap = ctypes.windll.gdi32.CreateDIBSection(
-            self._mem_dc,
-            ctypes.byref(bi),
-            0,  # DIB_RGB_COLORS
-            ctypes.byref(ppv_bits),
-            None,
-            0,
-        )
-        self._dib_bits = ppv_bits
+    def paintEvent(self, event) -> None:
+        """Render detection data via QPainter (called by Qt on main thread)."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        self._old_bitmap = ctypes.windll.gdi32.SelectObject(self._mem_dc, self._bitmap)
+        # Read latest data under lock
+        with self._lock:
+            detections = list(self._detections)
+            target = self._target
+            active = self._active
+            fps = self._fps
+            detect_ms = self._detect_ms
 
-        # Create a font
-        font_height = 16
-        self._hfont = ctypes.windll.gdi32.CreateFontW(
-            font_height, 0, 0, 0,
-            400,  # FW_NORMAL
-            0, 0, 0,
-            1,  # DEFAULT_CHARSET
-            0, 0, 0, 0,
-            "Consolas",
-        )
-        ctypes.windll.gdi32.SelectObject(self._mem_dc, self._hfont)
-
-    def _destroy_gdi(self) -> None:
-        """Release GDI resources."""
-        if self._hfont:
-            ctypes.windll.gdi32.DeleteObject(self._hfont)
-            self._hfont = None
-        if self._old_bitmap and self._mem_dc:
-            ctypes.windll.gdi32.SelectObject(self._mem_dc, self._old_bitmap)
-            self._old_bitmap = None
-        if self._bitmap:
-            ctypes.windll.gdi32.DeleteObject(self._bitmap)
-            self._bitmap = None
-        if self._mem_dc:
-            ctypes.windll.gdi32.DeleteDC(self._mem_dc)
-            self._mem_dc = None
-        if self._hdc:
-            ctypes.windll.gdi32.DeleteDC(self._hdc)
-            self._hdc = None
-
-    def _draw_frame(
-        self,
-        detections: List[Detection],
-        target: Optional[Detection],
-        active: bool,
-        fps: float,
-        detect_ms: float,
-    ) -> None:
-        """Draw a full frame of detection data onto the overlay."""
-        if not self._mem_dc or not self._hwnd:
-            return
-
-        hdc = self._mem_dc
-
-        # Clear with full transparency
-        brush = ctypes.windll.gdi32.CreateSolidBrush(0x00000000)
-        rect = ctypes.wintypes.RECT(0, 0, self._w, self._h)
-        ctypes.windll.user32.FillRect(hdc, ctypes.byref(rect), brush)
-        ctypes.windll.gdi32.DeleteObject(brush)
-
-        # Create a pen for outlines (2px, green for target)
-        pen_target = ctypes.windll.gdi32.CreatePen(0, 2, COLOR_TARGET)
-        pen_detect = ctypes.windll.gdi32.CreatePen(0, 2, COLOR_DETECTION)
-        pen_aim = ctypes.windll.gdi32.CreatePen(0, 2, COLOR_AIM)
-
-        # Set text color and background mode
-        ctypes.windll.gdi32.SetTextColor(hdc, COLOR_TEXT)
-        ctypes.windll.gdi32.SetBkMode(hdc, 1)  # TRANSPARENT
-
-        # Draw crosshair at center
+        # --- Crosshair at screen center ---
         cx, cy = self._w // 2, self._h // 2
-        ctypes.windll.gdi32.SelectObject(hdc, pen_target)
-        ctypes.windll.gdi32.MoveToEx(hdc, cx - 10, cy, None)
-        ctypes.windll.gdi32.LineTo(hdc, cx + 10, cy)
-        ctypes.windll.gdi32.MoveToEx(hdc, cx, cy - 10, None)
-        ctypes.windll.gdi32.LineTo(hdc, cx, cy + 10)
+        painter.setPen(QPen(QColor(0, 255, 0), 1))  # Green
+        painter.drawLine(cx - 12, cy, cx + 12, cy)
+        painter.drawLine(cx, cy - 12, cx, cy + 12)
 
-        # Draw detection boxes
+        # --- Detection boxes ---
         if self._show_boxes:
+            pen_target = QPen(QColor(0, 255, 0), 2)    # Green for target
+            pen_detect = QPen(QColor(255, 165, 0), 2)  # Orange for others
+            pen_aim = QPen(QColor(255, 0, 0), 2)       # Red for aim point
+
             for det in detections:
                 is_target = (target is not None and det is target)
                 pen = pen_target if is_target else pen_detect
-                ctypes.windll.gdi32.SelectObject(hdc, pen)
+                painter.setPen(pen)
 
                 x1, y1, x2, y2 = det.bbox
-                ctypes.windll.gdi32.MoveToEx(hdc, x1, y1, None)
-                ctypes.windll.gdi32.LineTo(hdc, x2, y1)
-                ctypes.windll.gdi32.LineTo(hdc, x2, y2)
-                ctypes.windll.gdi32.LineTo(hdc, x1, y2)
-                ctypes.windll.gdi32.LineTo(hdc, x1, y1)
+                painter.drawRect(x1, y1, x2 - x1, y2 - y1)
 
-                # Draw aim point as a small filled circle (cross)
+                # Aim point cross
                 if det.aim_point:
                     ax, ay = det.aim_point
-                    ctypes.windll.gdi32.SelectObject(hdc, pen_aim)
-                    ctypes.windll.gdi32.MoveToEx(hdc, ax - 4, ay, None)
-                    ctypes.windll.gdi32.LineTo(hdc, ax + 4, ay)
-                    ctypes.windll.gdi32.MoveToEx(hdc, ax, ay - 4, None)
-                    ctypes.windll.gdi32.LineTo(hdc, ax, ay + 4)
+                    painter.setPen(pen_aim)
+                    painter.drawLine(ax - 5, ay, ax + 5, ay)
+                    painter.drawLine(ax, ay - 5, ax, ay + 5)
 
                 # Label
                 if self._show_labels:
                     label = f"[{det.class_id}] {det.confidence:.2f}"
-                    # Draw text with shadow for readability
-                    ctypes.windll.gdi32.SetTextColor(hdc, 0x00000000)  # Black shadow
-                    ctypes.windll.gdi32.TextOutW(hdc, x1 + 2, y1 - 17, label, len(label))
-                    ctypes.windll.gdi32.SetTextColor(hdc, COLOR_TEXT)
-                    ctypes.windll.gdi32.TextOutW(hdc, x1 + 1, y1 - 18, label, len(label))
-
+                    painter.setPen(QColor(255, 255, 255))
+                    # Draw shadow
+                    painter.drawText(x1 + 2, y1 - 5, label)
                     if is_target:
-                        tlabel = "TARGET"
-                        ctypes.windll.gdi32.TextOutW(hdc, x1 + 1, y2 + 2, tlabel, len(tlabel))
+                        painter.setPen(QPen(QColor(0, 255, 0)))
+                        painter.drawText(x1 + 1, y2 + 16, "TARGET")
 
-        # Status bar
+        # --- Status bar (top-left) ---
         if self._show_status:
             status_text = "AIM: ON" if active else "AIM: OFF"
-            st_color = COLOR_STATUS_ON if active else COLOR_STATUS_OFF
-            ctypes.windll.gdi32.SetTextColor(hdc, st_color)
-            ctypes.windll.gdi32.TextOutW(hdc, 10, 5, status_text, len(status_text))
+            color = QColor(0, 255, 0) if active else QColor(255, 0, 0)
+            painter.setPen(color)
+            painter.setFont(self._font)
+            painter.drawText(12, 20, status_text)
 
         if self._show_fps:
             fps_text = f"Detect: {fps:.1f} FPS | {detect_ms:.1f}ms"
-            ctypes.windll.gdi32.SetTextColor(hdc, COLOR_TEXT)
-            ctypes.windll.gdi32.TextOutW(hdc, 10, 25, fps_text, len(fps_text))
+            painter.setPen(QColor(255, 255, 255))
+            painter.setFont(self._font)
+            painter.drawText(12, 40, fps_text)
 
-        # Cleanup pens
-        ctypes.windll.gdi32.DeleteObject(pen_target)
-        ctypes.windll.gdi32.DeleteObject(pen_detect)
-        ctypes.windll.gdi32.DeleteObject(pen_aim)
-
-        # Fix alpha channel: GDI draws alpha=0 on 32-bit DIB sections.
-        # We need non-background pixels to have alpha=255 for UpdateLayeredWindow
-        # with AC_SRC_ALPHA to actually show anything.
-        arr = np.ctypeslib.as_array(
-            ctypes.cast(self._dib_bits, ctypes.POINTER(ctypes.c_uint8)),
-            shape=(self._h, self._w, 4),
-        )
-        alpha_mask = np.any(arr[:, :, :3] > 0, axis=2)
-        arr[:, :, 3] = np.where(alpha_mask, 255, 0).astype(np.uint8)
-
-        # Present: blit memory DC to window using UpdateLayeredWindow
-        blend = ctypes.wintypes.BLENDFUNCTION()
-        blend.BlendOp = AC_SRC_OVER
-        blend.BlendFlags = 0
-        blend.SourceConstantAlpha = 255
-        blend.AlphaFormat = AC_SRC_ALPHA  # Per-pixel alpha
-
-        ppt_src = ctypes.wintypes.POINT(0, 0)
-        ppt_dst = ctypes.wintypes.POINT(self._x, self._y)
-        psize = ctypes.wintypes.SIZE(self._w, self._h)
-
-        ctypes.windll.user32.UpdateLayeredWindow(
-            self._hwnd,
-            self._hdc,  # screen DC (not used when using blend+alpha)
-            ctypes.byref(ppt_dst),
-            ctypes.byref(psize),
-            self._mem_dc,
-            ctypes.byref(ppt_src),
-            0,  # color key (not used)
-            ctypes.byref(blend),
-            ULW_ALPHA,
-        )
+        painter.end()

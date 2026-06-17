@@ -9,13 +9,13 @@ Usage:
 
 import argparse
 import logging
-import signal
 import sys
-import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import yaml
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QApplication
 
 # Add project root to Python path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -199,6 +199,11 @@ Examples:
         sys.exit(1)
     print("Detector initialized.\n")
 
+    # Qt application MUST exist before any QWidget (ScreenOverlay) is created
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+
     # Create pipeline
     pipeline = AimBotPipeline(
         capture=capture,
@@ -233,15 +238,22 @@ Examples:
     print(f"Pipeline running. Press {config.pipeline.toggle_hotkey} to toggle aiming.")
     print(f"Press {config.pipeline.quit_hotkey} to quit.\n")
 
-    # Main loop — sleep until quit
-    try:
-        while pipeline.is_running and not pipeline.should_quit:
-            time.sleep(0.1)  # 10 Hz is plenty for quit polling
+    # Qt event loop on main thread (replaces the old while+sleep poll loop).
+    # A QTimer checks pipeline liveness at 10 Hz and quits the app when done.
+    def _check_pipeline():
+        if not pipeline.is_running or pipeline.should_quit:
+            app.quit()
 
+    timer = QTimer()
+    timer.timeout.connect(_check_pipeline)
+    timer.start(100)  # 10 Hz
+
+    try:
+        app.exec()
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
-
     finally:
+        timer.stop()
         print("Stopping pipeline...")
         pipeline.stop()
         if overlay is not None:
